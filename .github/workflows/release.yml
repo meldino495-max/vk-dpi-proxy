@@ -40,7 +40,7 @@ jobs:
       - name: Build Executable (Linux)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --onefile --name "vk-dpi-proxy-linux" --add-data "proxy.pac:." dpi_proxy.py
+          pyinstaller --onefile --name "vk-dpi-proxy-linux" --add-data "proxy.pac:." --add-data "assets/icon.png:assets" dpi_proxy.py
           mkdir -p dist_final
           chmod +x dist/vk-dpi-proxy-linux
           cd dist && zip ../dist_final/vk-dpi-proxy-linux.zip vk-dpi-proxy-linux
@@ -49,7 +49,7 @@ jobs:
       - name: Build Executable (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --onedir --windowed --name "vk-dpi-proxy" --add-data "proxy.pac:." dpi_proxy.py
+          pyinstaller --onedir --windowed --name "vk-dpi-proxy" --icon "assets/icon.icns" --add-data "proxy.pac:." --add-data "assets/icon.png:assets" dpi_proxy.py
           mkdir -p dist_final
           cd dist && zip -r ../dist_final/vk-dpi-proxy-macos.zip vk-dpi-proxy.app
 
@@ -57,7 +57,7 @@ jobs:
       - name: Build Executable (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --name "vk-dpi-proxy-windows" --add-data "proxy.pac;." dpi_proxy.py
+          pyinstaller --onefile --windowed --name "vk-dpi-proxy-windows" --icon "assets/icon.ico" --add-data "proxy.pac;." --add-data "assets/icon.png;assets" --add-data "assets/icon.ico;assets" dpi_proxy.py
           mkdir dist_final
           copy dist\vk-dpi-proxy-windows.exe dist_final\
 

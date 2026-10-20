@@ -1417,9 +1417,30 @@ class FragmentProxy:
 # GUI
 # ---------------------------------------------------------------------------
 
+def apply_window_icon(root: tk.Tk) -> None:
+    """Title bar and taskbar icon. Files sit beside the script, or in the frozen bundle."""
+    png = APP_DIR / "assets" / "icon.png"
+    ico = APP_DIR / "assets" / "icon.ico"
+    if png.is_file():
+        try:
+            image = tk.PhotoImage(file=str(png))
+            root.iconphoto(True, image)
+            # PhotoImage is dropped if nothing keeps a reference.
+            root._icon_image = image  # type: ignore[attr-defined]
+        except tk.TclError:
+            pass
+    if sys.platform == "win32" and ico.is_file():
+        try:
+            root.iconbitmap(str(ico))
+            root.iconbitmap(default=str(ico))
+        except tk.TclError:
+            pass
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        apply_window_icon(self)
         self.title("VK DPI Bypass Proxy")
         self.geometry("760x620")
         self.minsize(580, 480)
