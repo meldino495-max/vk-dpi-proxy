@@ -134,6 +134,104 @@ class PipeIntegrityTests(unittest.TestCase):
         self.assertEqual(got, msg)
 
 
+class EgressPolicyTests(unittest.TestCase):
+    def test_public_ip_allowlist(self):
+        self.assertTrue(P.is_public_ip("87.240.129.1"))
+        self.assertTrue(P.is_public_ip("2001:4860:4860::8888"))
+        for bad in (
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "not-an-ip",
+        ):
+            self.assertFalse(P.is_public_ip(bad), bad)
+
+    def test_ip_literal_and_hostname(self):
+        self.assertTrue(P.is_ip_literal("127.0.0.1"))
+        self.assertTrue(P.is_ip_literal("::1"))
+        self.assertFalse(P.is_ip_literal("vk.com"))
+        self.assertTrue(P.is_safe_hostname("sun9-76.userapi.com"))
+        self.assertFalse(P.is_safe_hostname("vk.com.evil.com/"))
+        self.assertFalse(P.is_safe_hostname("evil.com@vk.com"))
+        self.assertFalse(P.is_target_host("vk.com.evil.com"))
+        self.assertFalse(P.is_target_host("notvk.com"))
+        self.assertFalse(P.is_target_host("127.0.0.1"))
+        self.assertTrue(P.is_target_host("a.vk.com"))
+
+    def test_redirect_stays_on_host(self):
+        self.assertEqual(
+            P.safe_https_location("vk.com", "/login"),
+            "https://vk.com/login",
+        )
+        self.assertEqual(
+            P.safe_https_location("vk.com", "@evil.com"),
+            "https://vk.com/",
+        )
+        self.assertEqual(
+            P.safe_https_location("vk.com", "//evil.com"),
+            "https://vk.com/",
+        )
+
+    def test_only_vk_hosts_are_proxied(self):
+        self.assertTrue(P.is_allowed_proxy_target("vk.com", 443, connect=True))
+        self.assertTrue(P.is_allowed_proxy_target("sun9-76.userapi.com", 443, connect=True))
+        self.assertFalse(P.is_allowed_proxy_target("youtube.com", 443, connect=True))
+        self.assertFalse(P.is_allowed_proxy_target("vk.com", 22, connect=True))
+        self.assertFalse(P.is_allowed_proxy_target("1.1.1.1", 443, connect=True))
+        self.assertTrue(P.is_allowed_proxy_target("login.vk.ru", 80, connect=False))
+        self.assertFalse(P.is_allowed_proxy_target("example.com", 80, connect=False))
+
+    def test_proxy_backup_restores_previous_settings(self):
+        backup = {
+            "ProxyEnable": 1,
+            "ProxyServer": "127.0.0.1:9",
+            "AutoConfigURL": "http://corp.example/proxy.pac",
+        }
+        current = {
+            "ProxyEnable": 0,
+            "ProxyServer": "127.0.0.1:9",
+            "AutoConfigURL": P.PAC_URL,
+        }
+        self.assertTrue(
+            P.should_keep_proxy_backup(P.PAC_URL, P.PAC_URL, backup_exists=True)
+        )
+        self.assertFalse(
+            P.should_keep_proxy_backup(
+                "http://corp.example/proxy.pac", P.PAC_URL, backup_exists=True
+            )
+        )
+        restored = P.restored_proxy_settings(backup, current, P.PAC_URL)
+        self.assertEqual(restored["AutoConfigURL"], "http://corp.example/proxy.pac")
+        self.assertEqual(restored["ProxyEnable"], 1)
+        self.assertIsNone(
+            P.restored_proxy_settings(
+                None,
+                {"ProxyEnable": 1, "ProxyServer": "10.0.0.1:8080", "AutoConfigURL": ""},
+                P.PAC_URL,
+            )
+        )
+        removed = P.restored_proxy_settings(None, current, P.PAC_URL)
+        self.assertEqual(removed["AutoConfigURL"], "")
+        self.assertEqual(removed["ProxyServer"], "127.0.0.1:9")
+
+    def test_autostart_off_stays_off(self):
+        self.assertEqual(P.decide_autostart(False, False), (True, True))
+        self.assertEqual(P.decide_autostart(True, False), (False, False))
+        self.assertEqual(P.decide_autostart(True, True), (True, False))
+
+    def test_health_response_is_not_world_readable_cors(self):
+        src = Path(P.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("Access-Control-Allow-Origin", src)
+
+
 class ConnectClassifyTests(unittest.TestCase):
     def test_close_reasons(self):
         self.assertEqual(P.classify_close_error(TimeoutError("x")), "timeout")
@@ -151,6 +249,7 @@ class ContentScriptPresenceTests(unittest.TestCase):
         self.assertNotIn("4096", js)
         self.assertIn("sanitizeUrlForLog", js)
         self.assertIn("srcset", js)
+        self.assertIn("u.username", js)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ipaddress
+import json
 import os
 import random
 import re
@@ -256,12 +257,90 @@ def is_target_host(host: str) -> bool:
     h = host.lower().rstrip(".").split(":")[0]
     if h.startswith("["):
         h = h.strip("[]")
-    try:
-        ipaddress.ip_address(h)
+    if is_ip_literal(h):
         return False
-    except ValueError:
-        pass
     return any(h == s or h.endswith("." + s) for s in TARGET_SUFFIXES)
+
+
+def is_ip_literal(host: str) -> bool:
+    text = host.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def is_public_ip(ip: str) -> bool:
+    """Globally routable unicast only. Refuses loopback, private, link-local, CGNAT, multicast."""
+    text = ip.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    if (
+        addr.is_multicast
+        or addr.is_reserved
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_private
+        or addr.is_unspecified
+        or not addr.is_global
+    ):
+        return False
+    return True
+
+
+def is_safe_hostname(host: str) -> bool:
+    h = host.lower().rstrip(".")
+    if not h or len(h) > 253 or ".." in h:
+        return False
+    if h[0] in ".-" or h[-1] in ".-":
+        return False
+    return re.fullmatch(r"[a-z0-9.-]+", h) is not None
+
+
+def safe_https_location(host: str, path: str) -> str:
+    """Build a same-host https redirect. Drop paths that could change the authority."""
+    raw = path or "/"
+    query = ""
+    if "?" in raw:
+        raw, query = raw.split("?", 1)
+        query = "?" + query
+    if (
+        not raw.startswith("/")
+        or raw.startswith("//")
+        or any(ch in raw for ch in ("\\", "@", " ", "\r", "\n"))
+    ):
+        return f"https://{host}/"
+    return f"https://{host}{raw}{query}"
+
+
+def is_allowed_proxy_target(host: str, port: int, *, connect: bool) -> bool:
+    """Only VK hostnames on web ports. Health checks are handled before this."""
+    if is_ip_literal(host) or not is_safe_hostname(host) or not is_target_host(host):
+        return False
+    if connect:
+        return port == 443
+    return port in (80, 443)
+
+
+def decide_autostart(initialized: bool, currently_enabled: bool) -> tuple[bool, bool]:
+    """
+    First launch turns autostart on and records that choice.
+    Later launches keep whatever the user last set, including off.
+    Returns (should_be_enabled, write_initialized_marker).
+    """
+    if initialized:
+        return currently_enabled, False
+    return True, True
 
 
 def is_image_cdn_host(host: str) -> bool:
@@ -703,6 +782,9 @@ def connect_remote(
     for family, socktype, proto, sockaddr in ordered:
         ip = str(sockaddr[0])
         tried.append(ip)
+        if not is_public_ip(ip):
+            last_err = OSError("refusing non-public destination")
+            continue
         if is_blocked_ip(ip):
             last_err = TimeoutError(f"known-blocked prefix {ip}")
             continue
@@ -749,7 +831,7 @@ def _connect_fallback(
         )
     for ip in candidates:
         tag = f"{ip}(fallback)"
-        if ip in tried or tag in tried or is_blocked_ip(ip):
+        if not is_public_ip(ip) or ip in tried or tag in tried or is_blocked_ip(ip):
             continue
         tried.append(tag)
         try:
@@ -886,6 +968,7 @@ class _PacHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
         else:
@@ -951,43 +1034,162 @@ def _win_inet_refresh() -> None:
         pass
 
 
+_INET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+def _proxy_backup_path() -> Path:
+    base = os.environ.get("APPDATA")
+    root = Path(base) if base else Path.home()
+    return root / "VKDpiBypassProxy" / "proxy-settings-backup.json"
+
+
+def should_keep_proxy_backup(
+    auto_config_url: str, our_pac: str, backup_exists: bool
+) -> bool:
+    """Keep the snapshot only while our PAC is still the active one."""
+    return bool(backup_exists and our_pac and our_pac in (auto_config_url or ""))
+
+
+def restored_proxy_settings(
+    backup: Optional[dict], current: dict, our_pac: str
+) -> Optional[dict]:
+    """
+    Settings to write back.
+    None means the registry is not ours and there is no snapshot, so leave it alone.
+    """
+    if isinstance(backup, dict):
+        enable = backup.get("ProxyEnable", 0)
+        try:
+            enable = int(enable)
+        except (TypeError, ValueError):
+            enable = 0
+        return {
+            "ProxyEnable": 1 if enable else 0,
+            "ProxyServer": str(backup.get("ProxyServer") or ""),
+            "AutoConfigURL": str(backup.get("AutoConfigURL") or ""),
+        }
+    url = str(current.get("AutoConfigURL") or "")
+    if our_pac and our_pac in url:
+        enable = current.get("ProxyEnable", 0)
+        try:
+            enable = int(enable)
+        except (TypeError, ValueError):
+            enable = 0
+        return {
+            "ProxyEnable": 1 if enable else 0,
+            "ProxyServer": str(current.get("ProxyServer") or ""),
+            "AutoConfigURL": "",
+        }
+    return None
+
+
+def _read_inet_settings() -> dict:
+    import winreg
+
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _INET_SETTINGS_KEY, 0, winreg.KEY_READ
+    )
+    try:
+        def _get(name: str, default):
+            try:
+                value, _typ = winreg.QueryValueEx(key, name)
+                return value
+            except OSError:
+                return default
+
+        enable = _get("ProxyEnable", 0)
+        try:
+            enable = int(enable)
+        except (TypeError, ValueError):
+            enable = 0
+        return {
+            "ProxyEnable": 1 if enable else 0,
+            "ProxyServer": str(_get("ProxyServer", "") or ""),
+            "AutoConfigURL": str(_get("AutoConfigURL", "") or ""),
+        }
+    finally:
+        winreg.CloseKey(key)
+
+
+def _write_inet_settings(settings: dict) -> None:
+    import winreg
+
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        _INET_SETTINGS_KEY,
+        0,
+        winreg.KEY_SET_VALUE,
+    )
+    try:
+        winreg.SetValueEx(
+            key, "ProxyEnable", 0, winreg.REG_DWORD, int(settings.get("ProxyEnable") or 0)
+        )
+        winreg.SetValueEx(
+            key, "ProxyServer", 0, winreg.REG_SZ, str(settings.get("ProxyServer") or "")
+        )
+        winreg.SetValueEx(
+            key,
+            "AutoConfigURL",
+            0,
+            winreg.REG_SZ,
+            str(settings.get("AutoConfigURL") or ""),
+        )
+    finally:
+        winreg.CloseKey(key)
+    _win_inet_refresh()
+
+
+def _save_proxy_backup(settings: dict) -> None:
+    path = _proxy_backup_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=True), encoding="ascii")
+
+
+def _load_proxy_backup() -> Optional[dict]:
+    path = _proxy_backup_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def windows_set_pac(url: str) -> None:
     if sys.platform != "win32":
         raise RuntimeError("仅支持 Windows")
-    import winreg
-
-    key = winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        0,
-        winreg.KEY_SET_VALUE,
+    current = _read_inet_settings()
+    if not should_keep_proxy_backup(
+        current.get("AutoConfigURL", ""), url, _proxy_backup_path().is_file()
+    ):
+        _save_proxy_backup(current)
+    _write_inet_settings(
+        {
+            "ProxyEnable": 0,
+            "ProxyServer": current.get("ProxyServer", ""),
+            "AutoConfigURL": url,
+        }
     )
-    try:
-        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, url)
-    finally:
-        winreg.CloseKey(key)
-    _win_inet_refresh()
 
 
-def windows_clear_proxy() -> None:
+def windows_clear_proxy() -> str:
+    """Restore the proxy settings from before our PAC. Returns restored, removed, or unchanged."""
     if sys.platform != "win32":
         raise RuntimeError("仅支持 Windows")
-    import winreg
-
-    key = winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        0,
-        winreg.KEY_SET_VALUE,
-    )
-    try:
-        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, "")
-        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, "")
-    finally:
-        winreg.CloseKey(key)
-    _win_inet_refresh()
+    current = _read_inet_settings()
+    backup = _load_proxy_backup()
+    planned = restored_proxy_settings(backup, current, PAC_URL)
+    if planned is None:
+        return "unchanged"
+    _write_inet_settings(planned)
+    if backup is not None:
+        try:
+            _proxy_backup_path().unlink()
+        except OSError:
+            pass
+        return "restored"
+    return "removed"
 
 
 _AUTOSTART_RUN_NAME = "VKDpiBypassProxy"
@@ -1024,6 +1226,18 @@ def windows_autostart_is_enabled() -> bool:
             winreg.CloseKey(key)
     except OSError:
         return False
+
+
+def _autostart_marker_path() -> Path:
+    base = os.environ.get("APPDATA")
+    root = Path(base) if base else Path.home()
+    return root / "VKDpiBypassProxy" / "autostart-initialized"
+
+
+def _mark_autostart_initialized() -> None:
+    path = _autostart_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("1\n", encoding="ascii")
 
 
 def windows_set_autostart(enabled: bool) -> None:
@@ -1145,6 +1359,17 @@ class FragmentProxy:
         self._thread = None
         self.log(f"[{now()}] Proxy stopped (listener + {len(live)} connection(s) closed)")
 
+    def _reject(self, client: socket.socket, detail: str) -> None:
+        try:
+            client.sendall(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+        except OSError:
+            pass
+        self.log(f"[{now()}] [DENY] {detail[:200]}")
+
     def _accept_loop(self, listen: socket.socket) -> None:
         while not self._stop.is_set():
             try:
@@ -1185,6 +1410,9 @@ class FragmentProxy:
             m = CONNECT_RE.match(req)
             if m:
                 host, port = parse_connect_target(m.group(1))
+                if not is_allowed_proxy_target(host, port, connect=True):
+                    self._reject(client, f"CONNECT {host}:{port}")
+                    return
                 remote = self._handle_connect(client, host, port, active)
                 return
 
@@ -1274,9 +1502,8 @@ class FragmentProxy:
         self, client: socket.socket, req: bytes, active: int
     ) -> Optional[socket.socket]:
         """
-        Forward plain HTTP. For VK hosts, 302 → HTTPS avoids broken http auth loops
-        when the browser still probes http://login.vk.ru.
-        Never mutates response bodies for image (or any) content.
+        VK hostnames only. Port 80 answers with a same-host HTTPS redirect.
+        Never mutates response bodies.
         """
         try:
             host, port = parse_http_host(req)
@@ -1301,14 +1528,21 @@ class FragmentProxy:
             client.sendall(
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
-                b"Access-Control-Allow-Origin: *\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
                 b"Connection: close\r\n\r\n" + body
             )
             return None
 
+        if not is_allowed_proxy_target(host, port, connect=False):
+            self._reject(client, f"HTTP {host}:{port}")
+            return None
+
         if is_target_host(host) and port == 80:
-            loc = f"https://{host}{path}".encode("ascii", errors="ignore")
+            try:
+                loc = safe_https_location(host, path).encode("ascii", errors="strict")
+            except UnicodeEncodeError:
+                self._reject(client, f"HTTP {host}:{port}")
+                return None
             client.sendall(
                 b"HTTP/1.1 302 Found\r\n"
                 b"Location: " + loc + b"\r\n"
@@ -1582,19 +1816,24 @@ class App(tk.Tk):
         self._ensure_autostart_default()
 
     def _ensure_autostart_default(self) -> None:
-        """Turn on Windows login autostart once (user can uncheck)."""
+        """Turn on Windows login autostart once. A later uncheck stays off."""
         if sys.platform != "win32":
             return
-        if windows_autostart_is_enabled():
-            self.autostart_var.set(True)
-            return
-        try:
-            windows_set_autostart(True)
-            self.autostart_var.set(True)
-            self._ui_log(f"[{now()}] 已开启开机自启（取消勾选可关闭）")
-        except Exception as exc:
-            self.autostart_var.set(False)
-            self._ui_log(f"[{now()}] 开机自启设置失败: {exc}")
+        enabled_now = windows_autostart_is_enabled()
+        should_on, write_marker = decide_autostart(
+            _autostart_marker_path().is_file(), enabled_now
+        )
+        if write_marker:
+            try:
+                _mark_autostart_initialized()
+                if should_on and not enabled_now:
+                    windows_set_autostart(True)
+                    self._ui_log(
+                        f"[{now()}] 已开启开机自启（取消勾选可关闭，关闭后不会再自动打开）"
+                    )
+            except Exception as exc:
+                self._ui_log(f"[{now()}] 开机自启设置失败: {exc}")
+        self.autostart_var.set(windows_autostart_is_enabled())
 
     def _on_mode(self) -> None:
         self.proxy.mode = self.mode_var.get()
@@ -1614,6 +1853,7 @@ class App(tk.Tk):
             return
         want = bool(self.autostart_var.get())
         try:
+            _mark_autostart_initialized()
             windows_set_autostart(want)
         except Exception as exc:
             self.autostart_var.set(windows_autostart_is_enabled())
@@ -1697,21 +1937,36 @@ class App(tk.Tk):
             messagebox.showinfo("提示", "请在浏览器里关闭代理即可。")
             return
         try:
-            windows_clear_proxy()
+            outcome = windows_clear_proxy()
         except Exception as exc:
             messagebox.showerror("关闭失败", str(exc))
             return
-        self._ui_log(f"[{now()}] Windows proxy cleared — direct connection")
-        messagebox.showinfo(
-            "已恢复直连",
-            "系统代理已关闭。\n请完全退出浏览器再打开，YouTube 应恢复正常。",
-        )
+        if outcome == "restored":
+            self._ui_log(f"[{now()}] Windows proxy restored to the previous settings")
+            messagebox.showinfo(
+                "已恢复直连",
+                "已写回开启「仅代理 VK」之前的系统代理。\n"
+                "请完全退出浏览器再打开。",
+            )
+        elif outcome == "removed":
+            self._ui_log(f"[{now()}] Removed this app's PAC; other proxy settings kept")
+            messagebox.showinfo(
+                "已恢复直连",
+                "已去掉本软件的 PAC，原来的系统代理没动。\n"
+                "请完全退出浏览器再打开。",
+            )
+        else:
+            self._ui_log(f"[{now()}] Windows proxy was not set by this app")
+            messagebox.showinfo(
+                "已恢复直连",
+                "当前系统代理不是本软件设置的，没有改动。",
+            )
 
     def _on_close(self) -> None:
         if sys.platform == "win32":
             try:
                 windows_clear_proxy()
-                self._ui_log(f"[{now()}] Auto-cleared Windows proxy on exit")
+                self._ui_log(f"[{now()}] Restored previous Windows proxy on exit")
             except Exception:
                 pass
         if self.proxy.running or (

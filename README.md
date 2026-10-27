@@ -16,7 +16,7 @@ python dpi_proxy.py
 
 ### 方式 B：下载 Release 可执行文件
 
-在本仓库 [Releases](https://github.com/secure-artifacts/vk-dpi-proxy/releases) 下载对应平台产物：
+在本仓库 [Releases](https://github.com/meldino495-max/vk-dpi-proxy/releases) 下载对应平台产物：
 
 - Windows：`vk-dpi-proxy-windows.exe`
 - macOS：`vk-dpi-proxy-macos.zip`（解压后打开 `.app`）
